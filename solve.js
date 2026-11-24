@@ -14,8 +14,14 @@ function slugger() {
     if (slug !== undefined) return slug;
     const ascii = /[^\x00-\x7f]/.test(text)
       ? text.normalize('NFKD').replace(/\p{M}/gu, '') : text;
-    slug = ascii.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-/, '')
-      .slice(0, 64).replace(/-$/, '').toLowerCase() || 'untitled';
+    // Same as .replace(/^-/, '').slice(0, 64).replace(/-$/, ''): the first
+    // replace collapses every run to one '-', so at most one '-' can sit at
+    // either end; a char check replaces those two regex passes.
+    slug = ascii.replace(/[^A-Za-z0-9]+/g, '-');
+    if (slug[0] === '-') slug = slug.slice(1);
+    slug = slug.slice(0, 64);
+    if (slug[slug.length - 1] === '-') slug = slug.slice(0, -1);
+    slug = slug.toLowerCase() || 'untitled';
     cache.set(text, slug);
     return slug;
   };
@@ -204,7 +210,12 @@ function markdown(body, href, slug) {
     const code = first === '`' && fence.exec(line);
     if (code) {
       html += code[1] ? `<pre><code class="language-${code[1]}">` : '<pre><code>';
-      while (i < lines.length && !endFence.test(lines[i])) html += escape(lines[i++]) + '\n';
+      const start = i;
+      while (i < lines.length && !endFence.test(lines[i])) i++;
+      // Escape is per-character, so escaping the joined lines (with the '\n'
+      // separators, which escape leaves alone) equals escaping each line,
+      // with one trailing '\n' after the last line as before.
+      if (i > start) html += escape(lines.slice(start, i).join('\n')) + '\n';
       i++;
       html += '</code></pre>\n';
       continue;
@@ -337,16 +348,29 @@ function renderer(name, source, includes, escaped) {
   const children = [];
   const js = ['let out = "";'];
   let loopCount = 0;
+  // Within one render call frame and root never change, and firstValue and
+  // property are pure reads, so an unbound path's value is the same at every
+  // use: resolve each distinct unbound path once into a local. Loop-bound
+  // paths keep their per-iteration variable reference and are not hoisted.
+  const hoisted = new Map();
   const current = () => loops.length ? 'f' + loops.at(-1).id : 'frame';
   function expr(path) {
     if (!pathPattern.test(path)) fail(quoted(path) + ' is not a path');
     const [first, ...rest] = path.split('.');
     const binding = loops.findLast(loop => first === 'loop' || first === loop.name);
     if (!binding) dependencies.add(first);
-    let value = binding ? (first === 'loop' ? 'f' + binding.id + '.loop' : 'v' + binding.id)
-      : `firstValue(frame,root,${quoted(first)})`;
+    if (binding) {
+      let value = first === 'loop' ? 'f' + binding.id + '.loop' : 'v' + binding.id;
+      for (const key of rest) value = `property(${value},${quoted(key)})`;
+      return value;
+    }
+    let hit = hoisted.get(path);
+    if (hit !== undefined) return hit.local;
+    const local = 'h' + hoisted.size;
+    let value = `firstValue(frame,root,${quoted(first)})`;
     for (const key of rest) value = `property(${value},${quoted(key)})`;
-    return value;
+    hoisted.set(path, { local, value });
+    return local;
   }
 
   for (const [kind, value] of tokens) {
@@ -395,6 +419,9 @@ loop:{index:${i}+1,first:${i}===0,last:${i}===${n}-1,length:${n}}};`);
     }
   }
   if (stack.length) fail(`a ${stack.at(-1).kind} is not closed`);
+  if (hoisted.size) {
+    js.splice(1, 0, ...[...hoisted.values()].map(({ local, value }) => `const ${local} = ${value};`));
+  }
   js.push('return out;');
   const render = new Function('firstValue', 'property', 'truth', 'stringify', 'escaped', 'includes',
     'return function(root,frame,depth){\n' + js.join('\n') + '\n}')(
@@ -467,6 +494,19 @@ function tagEntries(names, slug) {
   return entries;
 }
 
+function wordCount(text) {
+  // Same as text.trim().split(/\s+/).length, counted via whitespace runs:
+  // words = runs + 1, minus one when the text starts with whitespace and one
+  // when it ends with it (0 for an empty text). match() only builds the short
+  // whitespace runs, not a substring per word.
+  const runs = text.match(/\s+/g);
+  if (!runs) return text ? 1 : 0;
+  let count = runs.length + 1;
+  if (/^\s/.test(text)) count--;
+  if (/\s$/.test(text)) count--;
+  return count;
+}
+
 function dateText(date) {
   return date ? `${+date.slice(8, 10)} ${months[+date.slice(5, 7) - 1]} ${date.slice(0, 4)}` : '';
 }
@@ -521,7 +561,7 @@ export function run(input) {
       staticPaths.add(path);
       continue;
     }
-    const header = readHeader(content.replace(/\r\n?/g, '\n'));
+    const header = readHeader(content.includes('\r') ? content.replace(/\r\n?/g, '\n') : content);
     const post = path.startsWith('posts/');
     const reserved = path.startsWith('tags/') ? 'tags' : path.startsWith('page/') ? 'page' : '';
     let reason;
@@ -553,17 +593,37 @@ export function run(input) {
   }
 
   const broken = new Set();
+  // Link targets repeat across pages (same directory + target): resolve each
+  // once. A cached broken link still reports for this source's path, exactly
+  // as resolving it again would.
+  const hrefs = new Map();
   for (const source of sources) {
     source.md = markdown(source.body, target => {
-      if (external.test(target)) return target;
-      const hash = target.indexOf('#');
-      const path = relative(source.dir, hash < 0 ? target : target.slice(0, hash));
-      const fragment = hash < 0 ? '' : target.slice(hash);
-      const url = urls.get(path);
-      if (url !== undefined) return url + fragment;
-      if (staticPaths.has(path)) return base + '/' + path + fragment;
-      broken.add(`broken-link ${source.path} -> ${target}`);
-      return target;
+      const key = source.dir + '\0' + target;
+      const hit = hrefs.get(key);
+      if (hit !== undefined) {
+        if (hit[1]) broken.add(`broken-link ${source.path} -> ${target}`);
+        return hit[0];
+      }
+      let href;
+      let isBroken = false;
+      if (external.test(target)) {
+        href = target;
+      } else {
+        const hash = target.indexOf('#');
+        const path = relative(source.dir, hash < 0 ? target : target.slice(0, hash));
+        const fragment = hash < 0 ? '' : target.slice(hash);
+        const url = urls.get(path);
+        if (url !== undefined) href = url + fragment;
+        else if (staticPaths.has(path)) href = base + '/' + path + fragment;
+        else {
+          href = target;
+          isBroken = true;
+          broken.add(`broken-link ${source.path} -> ${target}`);
+        }
+      }
+      hrefs.set(key, [href, isBroken]);
+      return href;
     }, slug);
   }
 
@@ -574,7 +634,7 @@ export function run(input) {
     const { metadata, body, md } = source;
     const record = {
       ...makeLink(source), summary: metadata.summary ?? '', excerpt: md.excerpt,
-      reading_minutes: Math.max(1, Math.ceil((body.trim().split(/\s+/).length) / 200)), tags,
+      reading_minutes: Math.max(1, Math.ceil(wordCount(body) / 200)), tags,
     };
     for (const [key, name] of tagEntries(metadata.tags, slug)) {
       let tag = tagsBySlug.get(key);
